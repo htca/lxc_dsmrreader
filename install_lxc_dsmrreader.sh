@@ -48,7 +48,14 @@ require_command pvesh
 require_command pveam
 
 # ---------------------- DETECT LXC CONFIG FLAG ----------------------
-PCT_SET_HELP=$(pct set 0 --help 2>/dev/null || true)
+PCT_SET_HELP=$(pct set --help 2>/dev/null || true)
+if [[ -z "$PCT_SET_HELP" ]]; then
+    PCT_SET_HELP=$(pct set 0 --help 2>/dev/null || true)
+fi
+if [[ -z "$PCT_SET_HELP" ]]; then
+    error "Unable to read pct set help output."
+    exit 1
+fi
 
 detect_lxc_flag() {
     if echo "$PCT_SET_HELP" | grep -qE "^\s*--lxc\s"; then
