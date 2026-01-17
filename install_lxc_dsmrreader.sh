@@ -48,7 +48,7 @@ else
     EXISTING_TEMPLATE="$LATEST_TEMPLATE"
 fi
 
-TEMPLATE="local:vztmpl/$EXISTING_TEMPLATE"
+TEMPLATE="$EXISTING_TEMPLATE"
 info "Using template: ${YELLOW}$TEMPLATE${NC}"
 echo
 
