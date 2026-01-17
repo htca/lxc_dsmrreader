@@ -49,39 +49,69 @@ require_command pveam
 
 # ---------------------- DEFAULTS ----------------------
 ENABLE_NESTING=${ENABLE_NESTING:-0}
+ENABLE_FUSE=${ENABLE_FUSE:-1}
+ENABLE_UNCONFINED=${ENABLE_UNCONFINED:-1}
+ENABLE_CAP_DROP_EMPTY=${ENABLE_CAP_DROP_EMPTY:-1}
 
 # ---------------------- LXC CONFIG HELPERS ----------------------
 apply_lxc_config() {
     local ctid=$1
-    local profile_line="lxc.apparmor.profile: unconfined"
-    local cap_line="lxc.cap.drop:"
     local config_path="/etc/pve/lxc/${ctid}.conf"
+    local -a lines=()
 
-    if pct set "$ctid" --lxc "$profile_line" >/dev/null 2>&1 && pct set "$ctid" --lxc "$cap_line" >/dev/null 2>&1; then
-        ok "Applied LXC config via --lxc."
+    if [[ "$ENABLE_UNCONFINED" == "1" ]]; then
+        lines+=("lxc.apparmor.profile: unconfined")
+    fi
+    if [[ "$ENABLE_CAP_DROP_EMPTY" == "1" ]]; then
+        lines+=("lxc.cap.drop:")
+    fi
+
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        warn "Skipping LXC apparmor/cap settings (disabled)."
         return
     fi
 
-    if pct set "$ctid" -lxc "$profile_line" >/dev/null 2>&1 && pct set "$ctid" -lxc "$cap_line" >/dev/null 2>&1; then
-        ok "Applied LXC config via -lxc."
-        return
-    fi
-
-    if pct set "$ctid" -raw "$profile_line" >/dev/null 2>&1 && pct set "$ctid" -raw "$cap_line" >/dev/null 2>&1; then
-        ok "Applied LXC config via -raw."
-        return
-    fi
+    for flag in --lxc -lxc -raw; do
+        local ok_flag=1
+        for line in "${lines[@]}"; do
+            if ! pct set "$ctid" "$flag" "$line" >/dev/null 2>&1; then
+                ok_flag=0
+                break
+            fi
+        done
+        if [[ $ok_flag -eq 1 ]]; then
+            ok "Applied LXC config via $flag."
+            return
+        fi
+    done
 
     if [[ -w "$config_path" ]]; then
-        sed -i '/^lxc\.apparmor\.profile:/d' "$config_path"
-        sed -i '/^lxc\.cap\.drop:/d' "$config_path"
-        printf '%s\n' "$profile_line" "$cap_line" >> "$config_path"
+        if [[ "$ENABLE_UNCONFINED" == "1" ]]; then
+            sed -i '/^lxc\.apparmor\.profile:/d' "$config_path"
+            printf '%s\n' "lxc.apparmor.profile: unconfined" >> "$config_path"
+        fi
+        if [[ "$ENABLE_CAP_DROP_EMPTY" == "1" ]]; then
+            sed -i '/^lxc\.cap\.drop:/d' "$config_path"
+            printf '%s\n' "lxc.cap.drop:" >> "$config_path"
+        fi
         ok "Applied LXC config via config file."
         return
     fi
 
     error "Unable to apply LXC config lines."
     exit 1
+}
+
+remove_apparmor_profile() {
+    local ctid=$1
+    local config_path="/etc/pve/lxc/${ctid}.conf"
+
+    if [[ -w "$config_path" ]]; then
+        sed -i '/^lxc\.apparmor\.profile:/d' "$config_path"
+        return 0
+    fi
+
+    return 1
 }
 
 apply_usb_passthrough() {
@@ -226,7 +256,22 @@ start_container() {
     status=$?
 
     if echo "$output" | grep -q "lxc.apparmor.profile overrides"; then
-        warn "AppArmor override conflicts with nesting; retrying without nesting."
+        warn "AppArmor profile overrides LXC features."
+        if [[ "${KEEP_UNCONFINED:-}" != "1" ]]; then
+            warn "Retrying without explicit AppArmor profile."
+            remove_apparmor_profile "$ctid" || true
+            if output=$(pct start "$ctid" 2>&1); then
+                warn "Container started with default AppArmor profile."
+                return 0
+            fi
+            status=$?
+        else
+            warn "KEEP_UNCONFINED=1 set; keeping explicit AppArmor profile."
+        fi
+    fi
+
+    if echo "$output" | grep -q "features:nesting"; then
+        warn "Nesting conflicts with AppArmor override; retrying without nesting."
         if [[ "${KEEP_NESTING:-}" == "1" ]]; then
             error "KEEP_NESTING=1 set; not modifying nesting."
             echo "$output"
@@ -392,7 +437,10 @@ echo
 # ---------------------- CREATE LXC ----------------------
 info "Creating LXC ${YELLOW}$CTID${NC}..."
 
-FEATURES="fuse=1,keyctl=1"
+FEATURES="keyctl=1"
+if [[ "$ENABLE_FUSE" == "1" ]]; then
+    FEATURES="fuse=1,${FEATURES}"
+fi
 if [[ "$ENABLE_NESTING" == "1" ]]; then
     FEATURES="nesting=1,${FEATURES}"
 fi
@@ -408,7 +456,9 @@ pct create "$CTID" "$TEMPLATE" \
     --unprivileged 1
 
 pct set "$CTID" -onboot 1
-pct set "$CTID" -mp0 "/dev/fuse,mp=/dev/fuse"
+if [[ "$ENABLE_FUSE" == "1" ]]; then
+    pct set "$CTID" -mp0 "/dev/fuse,mp=/dev/fuse"
+fi
 
 # Apply required LXC config lines
 apply_lxc_config "$CTID"
