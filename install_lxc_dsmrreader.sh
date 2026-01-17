@@ -6,7 +6,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
@@ -30,13 +30,13 @@ echo
 # ---------------------- TEMPLATE DETECTION ----------------------
 info "Checking for Debian LXC templates..."
 
-EXISTING_TEMPLATE=$(pveam list local | awk '/debian-.*-amd64/ {print $2}' | sort -V | tail -n 1)
+EXISTING_TEMPLATE=$(pveam list local | awk '/debian-.*amd64/ {print $2}' | sort -V | tail -n 1)
 
 if [[ -n "$EXISTING_TEMPLATE" ]]; then
     ok "Found existing template: ${YELLOW}$EXISTING_TEMPLATE${NC}"
 else
     warn "No local Debian template found. Detecting latest available..."
-    LATEST_TEMPLATE=$(pveam available | awk '/debian-.*-amd64/ {print $2}' | sort -V | tail -n 1)
+    LATEST_TEMPLATE=$(pveam available | awk '/debian-.*amd64/ {print $2}' | sort -V | tail -n 1)
 
     if [[ -z "$LATEST_TEMPLATE" ]]; then
         error "Could not detect any Debian templates from pveam."
