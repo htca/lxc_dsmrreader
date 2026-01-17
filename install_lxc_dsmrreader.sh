@@ -141,6 +141,37 @@ disable_compose_usb_device() {
         ~/compose.yml'
 }
 
+generate_django_secret() {
+    local secret=""
+    local attempts=0
+
+    while [[ ${#secret} -lt 50 && $attempts -lt 5 ]]; do
+        secret=$(
+            (
+                set +o pipefail
+                LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 50
+            )
+        )
+        attempts=$((attempts + 1))
+    done
+
+    if [[ ${#secret} -lt 50 ]] && command -v openssl >/dev/null 2>&1; then
+        secret=$(
+            (
+                set +o pipefail
+                openssl rand -base64 64 | tr -dc 'A-Za-z0-9' | head -c 50
+            )
+        )
+    fi
+
+    if [[ ${#secret} -lt 50 ]]; then
+        error "Unable to generate DJANGO_SECRET_KEY automatically."
+        exit 1
+    fi
+
+    printf '%s' "$secret"
+}
+
 # ---------------------- AUTO CTID ----------------------
 CTID=$(pvesh get /cluster/nextid)
 HOSTNAME="dsmr"
@@ -255,7 +286,7 @@ done
 
 read -rp "$(echo -e "${CYAN}DJANGO_SECRET_KEY (leave empty to generate): ${NC}")" DJANGO_SECRET_KEY
 if [[ -z "$DJANGO_SECRET_KEY" ]]; then
-    DJANGO_SECRET_KEY=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 50)
+    DJANGO_SECRET_KEY=$(generate_django_secret)
 fi
 
 echo
