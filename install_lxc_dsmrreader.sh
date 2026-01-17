@@ -220,8 +220,10 @@ start_container() {
     local output=""
     local status=0
 
+    set +e
     output=$(pct start "$ctid" 2>&1)
     status=$?
+    set -e
     if [[ $status -eq 0 ]]; then
         return 0
     fi
@@ -234,8 +236,10 @@ start_container() {
             exit 1
         fi
         remove_feature_nesting "$ctid"
+        set +e
         output=$(pct start "$ctid" 2>&1)
         status=$?
+        set -e
         if [[ $status -eq 0 ]]; then
             warn "Container started without nesting; systemd isolation may be limited."
             return 0
@@ -247,6 +251,9 @@ start_container() {
     if [[ -f "/var/log/pve/lxc/${ctid}.log" ]]; then
         warn "Last 200 lines of /var/log/pve/lxc/${ctid}.log:"
         tail -n 200 "/var/log/pve/lxc/${ctid}.log"
+    elif command -v journalctl >/dev/null 2>&1; then
+        warn "Last 200 lines of journalctl for pve-container@${ctid}:"
+        journalctl -u "pve-container@${ctid}" --no-pager -n 200 || true
     fi
     exit 1
 }
