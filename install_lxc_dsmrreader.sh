@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 # ---------------------- COLORS ----------------------
 RED='\033[0;31m'
@@ -13,12 +13,14 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
 
+trap 'error "Script aborted unexpectedly."' ERR
+
 clear
-echo -e "${GREEN}=== DSMR-reader v6 Proxmox LXC Helper ===${NC}"
+echo -e "${GREEN}=== DSMR-reader v6 Proxmox 9 LXC Helper ===${NC}"
 echo
 
 # ---------------------- AUTO CTID ----------------------
-CTID=$(pvesh get /cluster/nextid)
+CTID=$(pvesh get /cluster/nextid || { error "Unable to get next CTID"; exit 1; })
 HOSTNAME="dsmr"
 MEMORY=1024
 DISK=8
@@ -30,7 +32,6 @@ echo
 # ---------------------- TEMPLATE DETECTION ----------------------
 info "Checking for Debian LXC templates..."
 
-# Extract column 1 (NAME), strip prefix, sort, pick newest
 EXISTING_TEMPLATE=$(pveam list local \
     | awk '/debian-.*amd64/ {print $1}' \
     | sed 's|local:vztmpl/||' \
@@ -53,7 +54,7 @@ else
     fi
 
     info "Downloading template: ${YELLOW}$LATEST_TEMPLATE${NC}"
-    pveam download local "$LATEST_TEMPLATE"
+    pveam download local "$LATEST_TEMPLATE" || { error "Template download failed"; exit 1; }
     EXISTING_TEMPLATE="$LATEST_TEMPLATE"
 fi
 
@@ -105,8 +106,8 @@ if [[ "$METHOD" == "1" ]]; then
     echo
 
 elif [[ "$METHOD" == "2" ]]; then
-    read -rp "$(echo -e "${CYAN}Enter ser2net host (e.g. 192.168.1.10): ${NC}")" SER2NET_HOST
-    read -rp "$(echo -e "${CYAN}Enter ser2net port (e.g. 2001): ${NC}")" SER2NET_PORT
+    read -rp "$(echo -e "${CYAN}Enter ser2net host: ${NC}")" SER2NET_HOST
+    read -rp "$(echo -e "${CYAN}Enter ser2net port: ${NC}")" SER2NET_PORT
     echo
 else
     error "Invalid choice"
@@ -124,18 +125,21 @@ pct create "$CTID" "$TEMPLATE" \
     --rootfs "local-lvm:$DISK" \
     --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp" \
     --features nesting=1,keyctl=1 \
-    --unprivileged 1
+    --unprivileged 1 || { error "LXC creation failed"; exit 1; }
 
 pct set "$CTID" -onboot 1
-pct set "$CTID" -mp0 /dev/fuse,mp=/dev/fuse
-pct set "$CTID" -lxc "lxc.apparmor.profile=unconfined"
-pct set "$CTID" -lxc "lxc.cap.drop="
+pct set "$CTID" -mp0 "/dev/fuse,mp=/dev/fuse"
 
+# Proxmox 9 raw LXC config
+pct set "$CTID" -raw "lxc.apparmor.profile=unconfined"
+pct set "$CTID" -raw "lxc.cap.drop="
+
+# USB passthrough
 if [[ "$METHOD" == "1" ]]; then
-    pct set "$CTID" -device0 "$USBDEV"
+    pct set "$CTID" -device0 "path=$USBDEV"
 fi
 
-pct start "$CTID"
+pct start "$CTID" || { error "Failed to start container"; exit 1; }
 sleep 5
 ok "LXC ${YELLOW}$CTID${NC} created and started."
 echo
@@ -149,7 +153,7 @@ apt install -y podman podman-compose podman-docker uidmap git systemd &&
 useradd dsmrreader --create-home &&
 usermod -a -G dialout dsmrreader &&
 loginctl enable-linger dsmrreader
-"
+" || { error "Failed to install base packages"; exit 1; }
 
 ok "Base packages and user created."
 echo
@@ -163,7 +167,7 @@ cd ~ &&
 wget -q https://raw.githubusercontent.com/dsmrreader/dsmr-reader/refs/heads/v6/provisioning/container/compose.prod.yml -O compose.yml &&
 wget -q https://raw.githubusercontent.com/dsmrreader/dsmr-reader/refs/heads/v6/provisioning/container/compose.prod.env -O compose.env
 '
-"
+" || { error "Failed to download compose files"; exit 1; }
 
 ok "Compose files downloaded."
 echo
@@ -173,18 +177,18 @@ info "Configuring DSMR-reader connection mode..."
 
 if [[ "$METHOD" == "1" ]]; then
     pct exec "$CTID" -- bash -c "
-    sudo -u dsmrreader bash -c '
-    sed -i \"s|DSMRREADER_DATALOGGER_MODE=.*|DSMRREADER_DATALOGGER_MODE=serial|\" compose.env
-    sed -i \"s|DSMRREADER_DATALOGGER_SERIAL_PORT=.*|DSMRREADER_DATALOGGER_SERIAL_PORT=$USBDEV|\" compose.env
-    '
+    sudo -u dsmrreader sed -i \
+        -e 's|DSMRREADER_DATALOGGER_MODE=.*|DSMRREADER_DATALOGGER_MODE=serial|' \
+        -e 's|DSMRREADER_DATALOGGER_SERIAL_PORT=.*|DSMRREADER_DATALOGGER_SERIAL_PORT=$USBDEV|' \
+        ~/compose.env
     "
 else
     pct exec "$CTID" -- bash -c "
-    sudo -u dsmrreader bash -c '
-    sed -i \"s|DSMRREADER_DATALOGGER_MODE=.*|DSMRREADER_DATALOGGER_MODE=tcp|\" compose.env
-    sed -i \"s|DSMRREADER_DATALOGGER_TCP_HOST=.*|DSMRREADER_DATALOGGER_TCP_HOST=$SER2NET_HOST|\" compose.env
-    sed -i \"s|DSMRREADER_DATALOGGER_TCP_PORT=.*|DSMRREADER_DATALOGGER_TCP_PORT=$SER2NET_PORT|\" compose.env
-    '
+    sudo -u dsmrreader sed -i \
+        -e 's|DSMRREADER_DATALOGGER_MODE=.*|DSMRREADER_DATALOGGER_MODE=tcp|' \
+        -e 's|DSMRREADER_DATALOGGER_TCP_HOST=.*|DSMRREADER_DATALOGGER_TCP_HOST=$SER2NET_HOST|' \
+        -e 's|DSMRREADER_DATALOGGER_TCP_PORT=.*|DSMRREADER_DATALOGGER_TCP_PORT=$SER2NET_PORT|' \
+        ~/compose.env
     "
 fi
 
@@ -199,7 +203,7 @@ sudo -u dsmrreader bash -c '
 cd ~ &&
 podman-compose up -d
 '
-"
+" || { error "Failed to start DSMR-reader containers"; exit 1; }
 
 ok "DSMR-reader containers started."
 echo
