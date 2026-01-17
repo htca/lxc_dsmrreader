@@ -90,6 +90,28 @@ apply_usb_passthrough() {
     local -a flags=(--device -device --dev -dev)
     local -a values=("$device_path_arg" "$dev_path")
 
+    if [[ -w "$config_path" ]]; then
+        local major_hex
+        local minor_hex
+        local major
+        local minor
+        local escaped_dev
+
+        major_hex=$(stat -c '%t' "$dev_path")
+        minor_hex=$(stat -c '%T' "$dev_path")
+        major=$((16#$major_hex))
+        minor=$((16#$minor_hex))
+        escaped_dev=${dev_path//\//\\/}
+
+        sed -i '/^dev0:/d' "$config_path"
+        sed -i "\\|^lxc\\.mount\\.entry: ${escaped_dev} |d" "$config_path"
+        sed -i "/^lxc\\.cgroup2\\.devices\\.allow: c ${major}:${minor} /d" "$config_path"
+        printf 'lxc.mount.entry: %s %s none bind,optional,create=file\n' "$dev_path" "$container_path" >> "$config_path"
+        printf 'lxc.cgroup2.devices.allow: c %s:%s rwm\n' "$major" "$minor" >> "$config_path"
+        ok "Added USB passthrough via config file."
+        return
+    fi
+
     for flag in "${flags[@]}"; do
         for value in "${values[@]}"; do
             if pct set "$ctid" "${flag}0" "$value" >/dev/null 2>&1; then
@@ -98,14 +120,6 @@ apply_usb_passthrough() {
             fi
         done
     done
-
-    if [[ -w "$config_path" ]]; then
-        sed -i '/^dev0:/d' "$config_path"
-        sed -i '/^lxc\.mount\.entry: .*dev\//d' "$config_path"
-        printf 'lxc.mount.entry: %s %s none bind,optional,create=file\n' "$dev_path" "$container_path" >> "$config_path"
-        ok "Added USB passthrough via config file."
-        return
-    fi
 
     error "Unable to configure USB device passthrough."
     exit 1
