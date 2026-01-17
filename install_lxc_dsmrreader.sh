@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # ---------------------- COLORS ----------------------
 RED='\033[0;31m'
@@ -13,11 +13,39 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
 
-trap 'error "Script aborted unexpectedly."' ERR
+on_error() {
+    local exit_code=$?
+    local line=$1
+    local cmd=$2
+    error "Command failed (exit ${exit_code}) at line ${line}: ${cmd}"
+}
+
+trap 'on_error $LINENO "$BASH_COMMAND"' ERR
+
+if [[ "${DEBUG:-}" == "1" ]]; then
+    set -x
+fi
 
 clear || true
 echo -e "${GREEN}=== DSMR-reader v6 Proxmox LXC Helper (PVE 8 & 9) ===${NC}"
 echo
+
+if [[ "${EUID}" -ne 0 ]]; then
+    error "Run this script as root (use sudo)."
+    exit 1
+fi
+
+require_command() {
+    local cmd=$1
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        error "Missing required command: $cmd"
+        exit 1
+    fi
+}
+
+require_command pct
+require_command pvesh
+require_command pveam
 
 # ---------------------- DETECT LXC CONFIG FLAG ----------------------
 PCT_SET_HELP=$(pct set 0 --help 2>/dev/null || true)
