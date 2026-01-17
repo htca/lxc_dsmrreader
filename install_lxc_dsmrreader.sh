@@ -172,6 +172,59 @@ generate_django_secret() {
     printf '%s' "$secret"
 }
 
+remove_feature_nesting() {
+    local ctid=$1
+    local config_path="/etc/pve/lxc/${ctid}.conf"
+
+    if [[ ! -w "$config_path" ]]; then
+        warn "Cannot edit ${config_path}; skipping nesting adjustment."
+        return
+    fi
+
+    local features
+    features=$(sed -n 's/^features:[[:space:]]*//p' "$config_path" | head -n 1)
+
+    if [[ -z "$features" ]]; then
+        return
+    fi
+
+    local updated
+    updated=$(printf '%s' "$features" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^nesting=' | paste -sd, -)
+
+    if [[ -z "$updated" ]]; then
+        sed -i '/^features:/d' "$config_path"
+    else
+        sed -i "s/^features:.*/features: $updated/" "$config_path"
+    fi
+}
+
+start_container() {
+    local ctid=$1
+    local output=""
+
+    if output=$(pct start "$ctid" 2>&1); then
+        return 0
+    fi
+
+    if echo "$output" | grep -q "lxc.apparmor.profile overrides"; then
+        warn "AppArmor override conflicts with nesting; retrying without nesting."
+        if [[ "${KEEP_NESTING:-}" == "1" ]]; then
+            error "KEEP_NESTING=1 set; not modifying nesting."
+            echo "$output"
+            exit 1
+        fi
+        remove_feature_nesting "$ctid"
+        if output=$(pct start "$ctid" 2>&1); then
+            warn "Container started without nesting; systemd isolation may be limited."
+            return 0
+        fi
+    fi
+
+    error "Failed to start container."
+    echo "$output"
+    exit 1
+}
+
 # ---------------------- AUTO CTID ----------------------
 CTID=$(pvesh get /cluster/nextid)
 HOSTNAME="dsmr"
@@ -325,7 +378,7 @@ if [[ "$METHOD" == "1" ]]; then
     apply_usb_passthrough "$CTID" "$USBDEV"
 fi
 
-pct start "$CTID"
+start_container "$CTID"
 sleep 5
 ok "LXC ${YELLOW}$CTID${NC} created and started."
 echo
