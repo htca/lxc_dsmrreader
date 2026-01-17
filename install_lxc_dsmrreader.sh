@@ -220,21 +220,10 @@ start_container() {
     local output=""
     local status=0
 
-    local old_err_trap
-    old_err_trap=$(trap -p ERR || true)
-    trap - ERR
-    set +e
-    output=$(pct start "$ctid" 2>&1)
-    status=$?
-    set -e
-    if [[ -n "$old_err_trap" ]]; then
-        eval "$old_err_trap"
-    else
-        trap 'on_error $LINENO "$BASH_COMMAND"' ERR
-    fi
-    if [[ $status -eq 0 ]]; then
+    if output=$(pct start "$ctid" 2>&1); then
         return 0
     fi
+    status=$?
 
     if echo "$output" | grep -q "lxc.apparmor.profile overrides"; then
         warn "AppArmor override conflicts with nesting; retrying without nesting."
@@ -244,21 +233,11 @@ start_container() {
             exit 1
         fi
         remove_feature_nesting "$ctid"
-        old_err_trap=$(trap -p ERR || true)
-        trap - ERR
-        set +e
-        output=$(pct start "$ctid" 2>&1)
-        status=$?
-        set -e
-        if [[ -n "$old_err_trap" ]]; then
-            eval "$old_err_trap"
-        else
-            trap 'on_error $LINENO "$BASH_COMMAND"' ERR
-        fi
-        if [[ $status -eq 0 ]]; then
+        if output=$(pct start "$ctid" 2>&1); then
             warn "Container started without nesting; systemd isolation may be limited."
             return 0
         fi
+        status=$?
     fi
 
     error "Failed to start container."
@@ -269,6 +248,14 @@ start_container() {
     elif command -v journalctl >/dev/null 2>&1; then
         warn "Last 200 lines of journalctl for pve-container@${ctid}:"
         journalctl -u "pve-container@${ctid}" --no-pager -n 200 || true
+    fi
+    if [[ "${ENABLE_PCT_DEBUG:-1}" == "1" ]]; then
+        warn "Attempting pct start --debug to capture /tmp/lxc-${ctid}.log ..."
+        pct start "$ctid" --debug >/dev/null 2>&1 || true
+        if [[ -f "/tmp/lxc-${ctid}.log" ]]; then
+            warn "Last 200 lines of /tmp/lxc-${ctid}.log:"
+            tail -n 200 "/tmp/lxc-${ctid}.log"
+        fi
     fi
     exit 1
 }
