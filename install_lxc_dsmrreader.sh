@@ -86,7 +86,7 @@ apply_usb_passthrough() {
     local dev_path=$2
     local device_path_arg="path=${dev_path}"
     local config_path="/etc/pve/lxc/${ctid}.conf"
-    local container_path="dev/serial/by-id/$(basename "$dev_path")"
+    local container_path="dev/$(basename "$dev_path")"
     local -a flags=(--device -device --dev -dev)
     local -a values=("$device_path_arg" "$dev_path")
 
@@ -101,7 +101,7 @@ apply_usb_passthrough() {
 
     if [[ -w "$config_path" ]]; then
         sed -i '/^dev0:/d' "$config_path"
-        sed -i '/^lxc\.mount\.entry: .*dev\/serial\/by-id\//d' "$config_path"
+        sed -i '/^lxc\.mount\.entry: .*dev\//d' "$config_path"
         printf 'lxc.mount.entry: %s %s none bind,optional,create=file\n' "$dev_path" "$container_path" >> "$config_path"
         ok "Added USB passthrough via config file."
         return
@@ -254,8 +254,18 @@ if [[ "$METHOD" == "1" ]]; then
 
     USBNAME="${USB_DEVICES[$CHOICE]}"
     USBDEV="/dev/serial/by-id/$USBNAME"
+    USBDEV_REAL=$(readlink -f "$USBDEV" || true)
+
+    if [[ -z "$USBDEV_REAL" || ! -c "$USBDEV_REAL" ]]; then
+        error "Unable to resolve USB device path for passthrough."
+        exit 1
+    fi
 
     ok "Selected USB device: ${YELLOW}$USBDEV${NC}"
+    if [[ "$USBDEV_REAL" != "$USBDEV" ]]; then
+        info "Resolved device path: ${YELLOW}$USBDEV_REAL${NC}"
+        USBDEV="$USBDEV_REAL"
+    fi
     echo
 
 elif [[ "$METHOD" == "2" ]]; then
