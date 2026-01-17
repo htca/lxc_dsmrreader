@@ -30,13 +30,22 @@ echo
 # ---------------------- TEMPLATE DETECTION ----------------------
 info "Checking for Debian LXC templates..."
 
-EXISTING_TEMPLATE=$(pveam list local | awk '/debian-.*amd64/ {print $1}' | sort -V | tail -n 1)
+# Extract column 1 (NAME), strip prefix, sort, pick newest
+EXISTING_TEMPLATE=$(pveam list local \
+    | awk '/debian-.*amd64/ {print $1}' \
+    | sed 's|local:vztmpl/||' \
+    | sort -V \
+    | tail -n 1)
 
 if [[ -n "$EXISTING_TEMPLATE" ]]; then
     ok "Found existing template: ${YELLOW}$EXISTING_TEMPLATE${NC}"
 else
     warn "No local Debian template found. Detecting latest available..."
-    LATEST_TEMPLATE=$(pveam available | awk '/debian-.*amd64/ {print $1}' | sort -V | tail -n 1)
+
+    LATEST_TEMPLATE=$(pveam available \
+        | awk '/debian-.*amd64/ {print $2}' \
+        | sort -V \
+        | tail -n 1)
 
     if [[ -z "$LATEST_TEMPLATE" ]]; then
         error "Could not detect any Debian templates from pveam."
@@ -48,7 +57,7 @@ else
     EXISTING_TEMPLATE="$LATEST_TEMPLATE"
 fi
 
-TEMPLATE="$EXISTING_TEMPLATE"
+TEMPLATE="local:vztmpl/$EXISTING_TEMPLATE"
 info "Using template: ${YELLOW}$TEMPLATE${NC}"
 echo
 
