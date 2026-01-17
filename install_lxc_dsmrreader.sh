@@ -47,6 +47,9 @@ require_command pct
 require_command pvesh
 require_command pveam
 
+# ---------------------- DEFAULTS ----------------------
+ENABLE_NESTING=${ENABLE_NESTING:-0}
+
 # ---------------------- LXC CONFIG HELPERS ----------------------
 apply_lxc_config() {
     local ctid=$1
@@ -215,8 +218,11 @@ remove_feature_nesting() {
 start_container() {
     local ctid=$1
     local output=""
+    local status=0
 
-    if output=$(pct start "$ctid" 2>&1); then
+    output=$(pct start "$ctid" 2>&1)
+    status=$?
+    if [[ $status -eq 0 ]]; then
         return 0
     fi
 
@@ -228,7 +234,9 @@ start_container() {
             exit 1
         fi
         remove_feature_nesting "$ctid"
-        if output=$(pct start "$ctid" 2>&1); then
+        output=$(pct start "$ctid" 2>&1)
+        status=$?
+        if [[ $status -eq 0 ]]; then
             warn "Container started without nesting; systemd isolation may be limited."
             return 0
         fi
@@ -236,6 +244,10 @@ start_container() {
 
     error "Failed to start container."
     echo "$output"
+    if [[ -f "/var/log/pve/lxc/${ctid}.log" ]]; then
+        warn "Last 200 lines of /var/log/pve/lxc/${ctid}.log:"
+        tail -n 200 "/var/log/pve/lxc/${ctid}.log"
+    fi
     exit 1
 }
 
@@ -371,6 +383,11 @@ echo
 # ---------------------- CREATE LXC ----------------------
 info "Creating LXC ${YELLOW}$CTID${NC}..."
 
+FEATURES="keyctl=1"
+if [[ "$ENABLE_NESTING" == "1" ]]; then
+    FEATURES="nesting=1,${FEATURES}"
+fi
+
 pct create "$CTID" "$TEMPLATE" \
     --hostname "$HOSTNAME" \
     --cores 2 \
@@ -378,7 +395,7 @@ pct create "$CTID" "$TEMPLATE" \
     --swap 512 \
     --rootfs "local-lvm:$DISK" \
     --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp" \
-    --features nesting=1,keyctl=1 \
+    --features "$FEATURES" \
     --unprivileged 1
 
 pct set "$CTID" -onboot 1
