@@ -220,10 +220,18 @@ start_container() {
     local output=""
     local status=0
 
+    local old_err_trap
+    old_err_trap=$(trap -p ERR || true)
+    trap - ERR
     set +e
     output=$(pct start "$ctid" 2>&1)
     status=$?
     set -e
+    if [[ -n "$old_err_trap" ]]; then
+        eval "$old_err_trap"
+    else
+        trap 'on_error $LINENO "$BASH_COMMAND"' ERR
+    fi
     if [[ $status -eq 0 ]]; then
         return 0
     fi
@@ -236,10 +244,17 @@ start_container() {
             exit 1
         fi
         remove_feature_nesting "$ctid"
+        old_err_trap=$(trap -p ERR || true)
+        trap - ERR
         set +e
         output=$(pct start "$ctid" 2>&1)
         status=$?
         set -e
+        if [[ -n "$old_err_trap" ]]; then
+            eval "$old_err_trap"
+        else
+            trap 'on_error $LINENO "$BASH_COMMAND"' ERR
+        fi
         if [[ $status -eq 0 ]]; then
             warn "Container started without nesting; systemd isolation may be limited."
             return 0
@@ -390,7 +405,7 @@ echo
 # ---------------------- CREATE LXC ----------------------
 info "Creating LXC ${YELLOW}$CTID${NC}..."
 
-FEATURES="keyctl=1"
+FEATURES="fuse=1,keyctl=1"
 if [[ "$ENABLE_NESTING" == "1" ]]; then
     FEATURES="nesting=1,${FEATURES}"
 fi
