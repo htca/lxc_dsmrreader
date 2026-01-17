@@ -21,16 +21,25 @@ echo
 
 # ---------------------- DETECT LXC CONFIG FLAG ----------------------
 detect_lxc_flag() {
-    if pct set 100 --help 2>/dev/null | grep -qE "^ *--lxc "; then
+    HELP=$(pct set 0 --help 2>/dev/null || true)
+
+    if echo "$HELP" | grep -qE "^\s*--lxc\s"; then
         echo "--lxc"
-    elif pct set 100 --help 2>/dev/null | grep -qE "^ *-lxc "; then
-        echo "-lxc"
-    elif pct set 100 --help 2>/dev/null | grep -qE "^ *-raw "; then
-        echo "-raw"
-    else
-        error "No supported LXC config flag found (unexpected Proxmox version)"
-        exit 1
+        return
     fi
+
+    if echo "$HELP" | grep -qE "^\s*-lxc\s"; then
+        echo "-lxc"
+        return
+    fi
+
+    if echo "$HELP" | grep -qE "^\s*-raw\s"; then
+        echo "-raw"
+        return
+    fi
+
+    error "No supported LXC config flag found. Unsupported Proxmox version."
+    exit 1
 }
 
 LXCFLAG=$(detect_lxc_flag)
@@ -76,4 +85,160 @@ else
     EXISTING_TEMPLATE="$LATEST_TEMPLATE"
 fi
 
-TEMPLATE="
+TEMPLATE="local:vztmpl/$EXISTING_TEMPLATE"
+info "Using template: ${YELLOW}$TEMPLATE${NC}"
+echo
+
+# ---------------------- CONNECTION METHOD ----------------------
+echo -e "${CYAN}Select P1 connection method:${NC}"
+echo -e "  ${YELLOW}1)${NC} USB device passthrough"
+echo -e "  ${YELLOW}2)${NC} ser2net (TCP)"
+read -rp "$(echo -e "${CYAN}Enter choice (1 or 2): ${NC}")" METHOD
+echo
+
+if [[ "$METHOD" == "1" ]]; then
+    info "Detecting USB serial devices..."
+    echo
+
+    USB_DEVICES=()
+    INDEX=1
+
+    for dev in /dev/serial/by-id/*; do
+        [[ -e "$dev" ]] || continue
+        TYPE=$(udevadm info -q property -n "$dev" | grep ID_MODEL= | cut -d= -f2)
+        BASENAME=$(basename "$dev")
+        echo -e "  ${YELLOW}$INDEX)${NC} $BASENAME  —  ${CYAN}$TYPE${NC}"
+        USB_DEVICES+=("$BASENAME")
+        INDEX=$((INDEX+1))
+    done
+
+    if [[ ${#USB_DEVICES[@]} -eq 0 ]]; then
+        error "No USB serial devices found."
+        exit 1
+    fi
+
+    echo
+    read -rp "$(echo -e "${CYAN}Select a device (1-${#USB_DEVICES[@]}): ${NC}")" CHOICE
+    CHOICE=$((CHOICE-1))
+
+    if [[ $CHOICE -lt 0 || $CHOICE -ge ${#USB_DEVICES[@]} ]]; then
+        error "Invalid selection"
+        exit 1
+    fi
+
+    USBNAME="${USB_DEVICES[$CHOICE]}"
+    USBDEV="/dev/serial/by-id/$USBNAME"
+
+    ok "Selected USB device: ${YELLOW}$USBDEV${NC}"
+    echo
+
+elif [[ "$METHOD" == "2" ]]; then
+    read -rp "$(echo -e "${CYAN}Enter ser2net host: ${NC}")" SER2NET_HOST
+    read -rp "$(echo -e "${CYAN}Enter ser2net port: ${NC}")" SER2NET_PORT
+    echo
+else
+    error "Invalid choice"
+    exit 1
+fi
+
+# ---------------------- CREATE LXC ----------------------
+info "Creating LXC ${YELLOW}$CTID${NC}..."
+
+pct create "$CTID" "$TEMPLATE" \
+    --hostname "$HOSTNAME" \
+    --cores 2 \
+    --memory "$MEMORY" \
+    --swap 512 \
+    --rootfs "local-lvm:$DISK" \
+    --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp" \
+    --features nesting=1,keyctl=1 \
+    --unprivileged 1
+
+pct set "$CTID" -onboot 1
+pct set "$CTID" -mp0 "/dev/fuse,mp=/dev/fuse"
+
+# Apply LXC config using detected flag
+pct set "$CTID" "$LXCFLAG" "lxc.apparmor.profile=unconfined"
+pct set "$CTID" "$LXCFLAG" "lxc.cap.drop="
+
+# USB passthrough
+if [[ "$METHOD" == "1" ]]; then
+    pct set "$CTID" -device0 "path=$USBDEV"
+fi
+
+pct start "$CTID"
+sleep 5
+ok "LXC ${YELLOW}$CTID${NC} created and started."
+echo
+
+# ---------------------- INSTALL DSMR-READER ----------------------
+info "Installing DSMR-reader inside container..."
+
+pct exec "$CTID" -- bash -c "
+apt update &&
+apt install -y podman podman-compose podman-docker uidmap git systemd &&
+useradd dsmrreader --create-home &&
+usermod -a -G dialout dsmrreader &&
+loginctl enable-linger dsmrreader
+"
+
+ok "Base packages and user created."
+echo
+
+# ---------------------- DOWNLOAD COMPOSE FILES ----------------------
+info "Downloading DSMR-reader compose files..."
+
+pct exec "$CTID" -- bash -c "
+sudo -u dsmrreader bash -c '
+cd ~ &&
+wget -q https://raw.githubusercontent.com/dsmrreader/dsmr-reader/refs/heads/v6/provisioning/container/compose.prod.yml -O compose.yml &&
+wget -q https://raw.githubusercontent.com/dsmrreader/dsmr-reader/refs/heads/v6/provisioning/container/compose.prod.env -O compose.env
+'
+"
+
+ok "Compose files downloaded."
+echo
+
+# ---------------------- CONFIGURE compose.env ----------------------
+info "Configuring DSMR-reader connection mode..."
+
+if [[ "$METHOD" == "1" ]]; then
+    pct exec "$CTID" -- bash -c "
+    sudo -u dsmrreader sed -i \
+        -e 's|DSMRREADER_DATALOGGER_MODE=.*|DSMRREADER_DATALOGGER_MODE=serial|' \
+        -e 's|DSMRREADER_DATALOGGER_SERIAL_PORT=.*|DSMRREADER_DATALOGGER_SERIAL_PORT=$USBDEV|' \
+        ~/compose.env
+    "
+else
+    pct exec "$CTID" -- bash -c "
+    sudo -u dsmrreader sed -i \
+        -e 's|DSMRREADER_DATALOGGER_MODE=.*|DSMRREADER_DATALOGGER_MODE=tcp|' \
+        -e 's|DSMRREADER_DATALOGGER_TCP_HOST=.*|DSMRREADER_DATALOGGER_TCP_HOST=$SER2NET_HOST|' \
+        -e 's|DSMRREADER_DATALOGGER_TCP_PORT=.*|DSMRREADER_DATALOGGER_TCP_PORT=$SER2NET_PORT|' \
+        ~/compose.env
+    "
+fi
+
+ok "compose.env configured."
+echo
+
+# ---------------------- START DSMR-READER ----------------------
+info "Starting DSMR-reader containers..."
+
+pct exec "$CTID" -- bash -c "
+sudo -u dsmrreader bash -c '
+cd ~ &&
+podman-compose up -d
+'
+"
+
+ok "DSMR-reader containers started."
+echo
+
+echo -e "${GREEN}------------------------------------------------------------${NC}"
+echo -e "${GREEN}DSMR-reader LXC created and installed.${NC}"
+echo -e "  ${CYAN}Container ID:${NC} ${YELLOW}$CTID${NC}"
+echo -e "  ${CYAN}Connection method:${NC} ${YELLOW}$([[ \"$METHOD\" == \"1\" ]] && echo USB || echo ser2net)${NC}"
+echo -e "${GREEN}------------------------------------------------------------${NC}"
+echo -e "Access DSMR-reader at: ${YELLOW}http://<container-ip>:7777${NC}"
+echo -e "${GREEN}------------------------------------------------------------${NC}"
