@@ -15,30 +15,55 @@ ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
 
 trap 'error "Script aborted unexpectedly."' ERR
 
-clear
+clear || true
 echo -e "${GREEN}=== DSMR-reader v6 Proxmox LXC Helper (PVE 8 & 9) ===${NC}"
 echo
 
 # ---------------------- DETECT LXC CONFIG FLAG ----------------------
-detect_lxc_flag() {
-    HELP=$(pct set 0 --help 2>/dev/null || true)
+PCT_SET_HELP=$(pct set 0 --help 2>/dev/null || true)
 
-    if echo "$HELP" | grep -qE "^\s*--lxc\s"; then
+detect_lxc_flag() {
+    if echo "$PCT_SET_HELP" | grep -qE "^\s*--lxc\s"; then
         echo "--lxc"
         return
     fi
 
-    if echo "$HELP" | grep -qE "^\s*-lxc\s"; then
+    if echo "$PCT_SET_HELP" | grep -qE "^\s*-lxc\s"; then
         echo "-lxc"
         return
     fi
 
-    if echo "$HELP" | grep -qE "^\s*-raw\s"; then
+    if echo "$PCT_SET_HELP" | grep -qE "^\s*-raw\s"; then
         echo "-raw"
         return
     fi
 
     error "No supported LXC config flag found. Unsupported Proxmox version."
+    exit 1
+}
+
+detect_device_flag() {
+    if echo "$PCT_SET_HELP" | grep -qE "^\s*--device(\[|[0-9])"; then
+        echo "--device"
+        return
+    fi
+
+    if echo "$PCT_SET_HELP" | grep -qE "^\s*-device(\[|[0-9])"; then
+        echo "-device"
+        return
+    fi
+
+    if echo "$PCT_SET_HELP" | grep -qE "^\s*--dev(\[|[0-9])"; then
+        echo "--dev"
+        return
+    fi
+
+    if echo "$PCT_SET_HELP" | grep -qE "^\s*-dev(\[|[0-9])"; then
+        echo "-dev"
+        return
+    fi
+
+    error "No supported device passthrough flag found. Unsupported Proxmox version."
     exit 1
 }
 
@@ -141,6 +166,12 @@ else
     exit 1
 fi
 
+if [[ "$METHOD" == "1" ]]; then
+    DEVFLAG_PREFIX=$(detect_device_flag)
+    info "Using device passthrough flag: ${YELLOW}${DEVFLAG_PREFIX}0${NC}"
+    echo
+fi
+
 # ---------------------- CREATE LXC ----------------------
 info "Creating LXC ${YELLOW}$CTID${NC}..."
 
@@ -163,7 +194,7 @@ pct set "$CTID" "$LXCFLAG" "lxc.cap.drop="
 
 # USB passthrough
 if [[ "$METHOD" == "1" ]]; then
-    pct set "$CTID" -device0 "path=$USBDEV"
+    pct set "$CTID" "${DEVFLAG_PREFIX}0" "$USBDEV"
 fi
 
 pct start "$CTID"
@@ -176,10 +207,14 @@ info "Installing DSMR-reader inside container..."
 
 pct exec "$CTID" -- bash -c "
 apt update &&
-apt install -y podman podman-compose podman-docker uidmap git systemd &&
+apt install -y podman podman-compose podman-docker uidmap git systemd wget ca-certificates fuse-overlayfs &&
 useradd dsmrreader --create-home &&
 usermod -a -G dialout dsmrreader &&
-loginctl enable-linger dsmrreader
+if command -v loginctl >/dev/null 2>&1; then
+  loginctl enable-linger dsmrreader || true
+else
+  echo 'loginctl not available; skipping linger enable.'
+fi
 "
 
 ok "Base packages and user created."
@@ -189,7 +224,7 @@ echo
 info "Downloading DSMR-reader compose files..."
 
 pct exec "$CTID" -- bash -c "
-sudo -u dsmrreader bash -c '
+runuser -l dsmrreader -c '
 cd ~ &&
 wget -q https://raw.githubusercontent.com/dsmrreader/dsmr-reader/refs/heads/v6/provisioning/container/compose.prod.yml -O compose.yml &&
 wget -q https://raw.githubusercontent.com/dsmrreader/dsmr-reader/refs/heads/v6/provisioning/container/compose.prod.env -O compose.env
@@ -203,20 +238,16 @@ echo
 info "Configuring DSMR-reader connection mode..."
 
 if [[ "$METHOD" == "1" ]]; then
-    pct exec "$CTID" -- bash -c "
-    sudo -u dsmrreader sed -i \
-        -e 's|DSMRREADER_DATALOGGER_MODE=.*|DSMRREADER_DATALOGGER_MODE=serial|' \
-        -e 's|DSMRREADER_DATALOGGER_SERIAL_PORT=.*|DSMRREADER_DATALOGGER_SERIAL_PORT=$USBDEV|' \
-        ~/compose.env
-    "
+    pct exec "$CTID" -- env USBDEV="$USBDEV" runuser -l dsmrreader -c 'sed -i \
+        -e "s|DSMRREADER_DATALOGGER_MODE=.*|DSMRREADER_DATALOGGER_MODE=serial|" \
+        -e "s|DSMRREADER_DATALOGGER_SERIAL_PORT=.*|DSMRREADER_DATALOGGER_SERIAL_PORT=$USBDEV|" \
+        ~/compose.env'
 else
-    pct exec "$CTID" -- bash -c "
-    sudo -u dsmrreader sed -i \
-        -e 's|DSMRREADER_DATALOGGER_MODE=.*|DSMRREADER_DATALOGGER_MODE=tcp|' \
-        -e 's|DSMRREADER_DATALOGGER_TCP_HOST=.*|DSMRREADER_DATALOGGER_TCP_HOST=$SER2NET_HOST|' \
-        -e 's|DSMRREADER_DATALOGGER_TCP_PORT=.*|DSMRREADER_DATALOGGER_TCP_PORT=$SER2NET_PORT|' \
-        ~/compose.env
-    "
+    pct exec "$CTID" -- env SER2NET_HOST="$SER2NET_HOST" SER2NET_PORT="$SER2NET_PORT" runuser -l dsmrreader -c 'sed -i \
+        -e "s|DSMRREADER_DATALOGGER_MODE=.*|DSMRREADER_DATALOGGER_MODE=tcp|" \
+        -e "s|DSMRREADER_DATALOGGER_TCP_HOST=.*|DSMRREADER_DATALOGGER_TCP_HOST=$SER2NET_HOST|" \
+        -e "s|DSMRREADER_DATALOGGER_TCP_PORT=.*|DSMRREADER_DATALOGGER_TCP_PORT=$SER2NET_PORT|" \
+        ~/compose.env'
 fi
 
 ok "compose.env configured."
@@ -226,7 +257,7 @@ echo
 info "Starting DSMR-reader containers..."
 
 pct exec "$CTID" -- bash -c "
-sudo -u dsmrreader bash -c '
+runuser -l dsmrreader -c '
 cd ~ &&
 podman-compose up -d
 '
