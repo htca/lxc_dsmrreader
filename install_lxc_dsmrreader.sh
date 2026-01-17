@@ -47,64 +47,99 @@ require_command pct
 require_command pvesh
 require_command pveam
 
-# ---------------------- DETECT LXC CONFIG FLAG ----------------------
-PCT_SET_HELP=$(pct set --help 2>/dev/null || true)
-if [[ -z "$PCT_SET_HELP" ]]; then
-    PCT_SET_HELP=$(pct set 0 --help 2>/dev/null || true)
-fi
-if [[ -z "$PCT_SET_HELP" ]]; then
-    error "Unable to read pct set help output."
-    exit 1
-fi
+# ---------------------- LXC CONFIG HELPERS ----------------------
+apply_lxc_config() {
+    local ctid=$1
+    local profile_line="lxc.apparmor.profile: unconfined"
+    local cap_line="lxc.cap.drop:"
+    local config_path="/etc/pve/lxc/${ctid}.conf"
 
-detect_lxc_flag() {
-    if echo "$PCT_SET_HELP" | grep -qE "^\s*--lxc\s"; then
-        echo "--lxc"
+    if pct set "$ctid" --lxc "$profile_line" >/dev/null 2>&1 && pct set "$ctid" --lxc "$cap_line" >/dev/null 2>&1; then
+        ok "Applied LXC config via --lxc."
         return
     fi
 
-    if echo "$PCT_SET_HELP" | grep -qE "^\s*-lxc\s"; then
-        echo "-lxc"
+    if pct set "$ctid" -lxc "$profile_line" >/dev/null 2>&1 && pct set "$ctid" -lxc "$cap_line" >/dev/null 2>&1; then
+        ok "Applied LXC config via -lxc."
         return
     fi
 
-    if echo "$PCT_SET_HELP" | grep -qE "^\s*-raw\s"; then
-        echo "-raw"
+    if pct set "$ctid" -raw "$profile_line" >/dev/null 2>&1 && pct set "$ctid" -raw "$cap_line" >/dev/null 2>&1; then
+        ok "Applied LXC config via -raw."
         return
     fi
 
-    error "No supported LXC config flag found. Unsupported Proxmox version."
-    exit 1
-}
-
-detect_device_flag() {
-    if echo "$PCT_SET_HELP" | grep -qE "^\s*--device(\[|[0-9])"; then
-        echo "--device"
+    if [[ -w "$config_path" ]]; then
+        sed -i '/^lxc\.apparmor\.profile:/d' "$config_path"
+        sed -i '/^lxc\.cap\.drop:/d' "$config_path"
+        printf '%s\n' "$profile_line" "$cap_line" >> "$config_path"
+        ok "Applied LXC config via config file."
         return
     fi
 
-    if echo "$PCT_SET_HELP" | grep -qE "^\s*-device(\[|[0-9])"; then
-        echo "-device"
-        return
-    fi
-
-    if echo "$PCT_SET_HELP" | grep -qE "^\s*--dev(\[|[0-9])"; then
-        echo "--dev"
-        return
-    fi
-
-    if echo "$PCT_SET_HELP" | grep -qE "^\s*-dev(\[|[0-9])"; then
-        echo "-dev"
-        return
-    fi
-
-    error "No supported device passthrough flag found. Unsupported Proxmox version."
+    error "Unable to apply LXC config lines."
     exit 1
 }
 
-LXCFLAG=$(detect_lxc_flag)
-info "Using LXC config flag: ${YELLOW}$LXCFLAG${NC}"
-echo
+apply_usb_passthrough() {
+    local ctid=$1
+    local dev_path=$2
+    local device_path_arg="path=${dev_path}"
+    local config_path="/etc/pve/lxc/${ctid}.conf"
+    local container_path="dev/serial/by-id/$(basename "$dev_path")"
+    local -a flags=(--device -device --dev -dev)
+    local -a values=("$device_path_arg" "$dev_path")
+
+    for flag in "${flags[@]}"; do
+        for value in "${values[@]}"; do
+            if pct set "$ctid" "${flag}0" "$value" >/dev/null 2>&1; then
+                ok "Added USB passthrough via ${flag}0."
+                return
+            fi
+        done
+    done
+
+    if [[ -w "$config_path" ]]; then
+        sed -i '/^dev0:/d' "$config_path"
+        sed -i '/^lxc\.mount\.entry: .*dev\/serial\/by-id\//d' "$config_path"
+        printf 'lxc.mount.entry: %s %s none bind,optional,create=file\n' "$dev_path" "$container_path" >> "$config_path"
+        ok "Added USB passthrough via config file."
+        return
+    fi
+
+    error "Unable to configure USB device passthrough."
+    exit 1
+}
+
+set_compose_env_var() {
+    local ctid=$1
+    local key=$2
+    local value=$3
+
+    pct exec "$ctid" -- env KEY="$key" VALUE="$value" runuser -l dsmrreader -c '
+        sed -i "/^${KEY}=.*/d" ~/compose.env
+        printf "%s=%s\n" "$KEY" "$VALUE" >> ~/compose.env
+    '
+}
+
+enable_compose_usb_device() {
+    local ctid=$1
+    local dev_path=$2
+
+    pct exec "$ctid" -- env USBDEV="$dev_path" runuser -l dsmrreader -c 'sed -i -E \
+        -e "s|^([[:space:]]*)#\\s*devices:|\\1devices:|" \
+        -e "s|^([[:space:]]*)#\\s*-\\s*/dev/[^ ]+:/dev/[^ ]+|\\1- $USBDEV:$USBDEV|" \
+        -e "s|/dev/ttyUSB0:/dev/ttyUSB0|$USBDEV:$USBDEV|" \
+        ~/compose.yml'
+}
+
+disable_compose_usb_device() {
+    local ctid=$1
+
+    pct exec "$ctid" -- runuser -l dsmrreader -c 'sed -i -E \
+        "/^[[:space:]]*devices:/,/^[[:space:]]*volumes:/ { /^[[:space:]]*volumes:/! s/^/# / }" \
+        ~/compose.yml'
+}
 
 # ---------------------- AUTO CTID ----------------------
 CTID=$(pvesh get /cluster/nextid)
@@ -201,11 +236,29 @@ else
     exit 1
 fi
 
-if [[ "$METHOD" == "1" ]]; then
-    DEVFLAG_PREFIX=$(detect_device_flag)
-    info "Using device passthrough flag: ${YELLOW}${DEVFLAG_PREFIX}0${NC}"
+# ---------------------- DSMR-READER INPUTS ----------------------
+info "Collecting DSMR-reader configuration..."
+
+read -rp "$(echo -e "${CYAN}Admin username: ${NC}")" DSMR_ADMIN_USER
+while [[ -z "$DSMR_ADMIN_USER" ]]; do
+    warn "Admin username cannot be empty."
+    read -rp "$(echo -e "${CYAN}Admin username: ${NC}")" DSMR_ADMIN_USER
+done
+
+read -rsp "$(echo -e "${CYAN}Admin password: ${NC}")" DSMR_ADMIN_PASSWORD
+echo
+while [[ -z "$DSMR_ADMIN_PASSWORD" ]]; do
+    warn "Admin password cannot be empty."
+    read -rsp "$(echo -e "${CYAN}Admin password: ${NC}")" DSMR_ADMIN_PASSWORD
     echo
+done
+
+read -rp "$(echo -e "${CYAN}DJANGO_SECRET_KEY (leave empty to generate): ${NC}")" DJANGO_SECRET_KEY
+if [[ -z "$DJANGO_SECRET_KEY" ]]; then
+    DJANGO_SECRET_KEY=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 50)
 fi
+
+echo
 
 # ---------------------- CREATE LXC ----------------------
 info "Creating LXC ${YELLOW}$CTID${NC}..."
@@ -223,13 +276,12 @@ pct create "$CTID" "$TEMPLATE" \
 pct set "$CTID" -onboot 1
 pct set "$CTID" -mp0 "/dev/fuse,mp=/dev/fuse"
 
-# Apply LXC config using detected flag
-pct set "$CTID" "$LXCFLAG" "lxc.apparmor.profile=unconfined"
-pct set "$CTID" "$LXCFLAG" "lxc.cap.drop="
+# Apply required LXC config lines
+apply_lxc_config "$CTID"
 
 # USB passthrough
 if [[ "$METHOD" == "1" ]]; then
-    pct set "$CTID" "${DEVFLAG_PREFIX}0" "$USBDEV"
+    apply_usb_passthrough "$CTID" "$USBDEV"
 fi
 
 pct start "$CTID"
@@ -241,9 +293,12 @@ echo
 info "Installing DSMR-reader inside container..."
 
 pct exec "$CTID" -- bash -c "
-apt update &&
-apt install -y podman podman-compose podman-docker uidmap git systemd wget ca-certificates fuse-overlayfs &&
-useradd dsmrreader --create-home &&
+export DEBIAN_FRONTEND=noninteractive
+apt-get update &&
+apt-get install -y podman podman-compose podman-docker uidmap git systemd wget ca-certificates fuse-overlayfs crun &&
+if ! id -u dsmrreader >/dev/null 2>&1; then
+  useradd dsmrreader --create-home
+fi &&
 usermod -a -G dialout dsmrreader &&
 if command -v loginctl >/dev/null 2>&1; then
   loginctl enable-linger dsmrreader || true
@@ -270,22 +325,29 @@ ok "Compose files downloaded."
 echo
 
 # ---------------------- CONFIGURE compose.env ----------------------
-info "Configuring DSMR-reader connection mode..."
+info "Configuring DSMR-reader environment..."
+
+DUID=$(pct exec "$CTID" -- id -u dsmrreader)
+DGID=$(pct exec "$CTID" -- id -g dsmrreader)
+
+set_compose_env_var "$CTID" DUID "$DUID"
+set_compose_env_var "$CTID" DGID "$DGID"
+set_compose_env_var "$CTID" DJANGO_SECRET_KEY "$DJANGO_SECRET_KEY"
+set_compose_env_var "$CTID" DSMRREADER_ADMIN_USER "$DSMR_ADMIN_USER"
+set_compose_env_var "$CTID" DSMRREADER_ADMIN_PASSWORD "$DSMR_ADMIN_PASSWORD"
 
 if [[ "$METHOD" == "1" ]]; then
-    pct exec "$CTID" -- env USBDEV="$USBDEV" runuser -l dsmrreader -c 'sed -i \
-        -e "s|DSMRREADER_DATALOGGER_MODE=.*|DSMRREADER_DATALOGGER_MODE=serial|" \
-        -e "s|DSMRREADER_DATALOGGER_SERIAL_PORT=.*|DSMRREADER_DATALOGGER_SERIAL_PORT=$USBDEV|" \
-        ~/compose.env'
+    set_compose_env_var "$CTID" DSMRREADER_DATALOGGER_MODE "serial"
+    set_compose_env_var "$CTID" DSMRREADER_DATALOGGER_SERIAL_PORT "$USBDEV"
+    enable_compose_usb_device "$CTID" "$USBDEV"
 else
-    pct exec "$CTID" -- env SER2NET_HOST="$SER2NET_HOST" SER2NET_PORT="$SER2NET_PORT" runuser -l dsmrreader -c 'sed -i \
-        -e "s|DSMRREADER_DATALOGGER_MODE=.*|DSMRREADER_DATALOGGER_MODE=tcp|" \
-        -e "s|DSMRREADER_DATALOGGER_TCP_HOST=.*|DSMRREADER_DATALOGGER_TCP_HOST=$SER2NET_HOST|" \
-        -e "s|DSMRREADER_DATALOGGER_TCP_PORT=.*|DSMRREADER_DATALOGGER_TCP_PORT=$SER2NET_PORT|" \
-        ~/compose.env'
+    set_compose_env_var "$CTID" DSMRREADER_DATALOGGER_MODE "tcp"
+    set_compose_env_var "$CTID" DSMRREADER_DATALOGGER_TCP_HOST "$SER2NET_HOST"
+    set_compose_env_var "$CTID" DSMRREADER_DATALOGGER_TCP_PORT "$SER2NET_PORT"
+    disable_compose_usb_device "$CTID"
 fi
 
-ok "compose.env configured."
+ok "compose.env and compose.yml configured."
 echo
 
 # ---------------------- START DSMR-READER ----------------------
@@ -294,7 +356,14 @@ info "Starting DSMR-reader containers..."
 pct exec "$CTID" -- bash -c "
 runuser -l dsmrreader -c '
 cd ~ &&
-podman-compose up -d
+podman-compose up -d &&
+if podman-compose systemd -a register; then
+  systemctl --user daemon-reload || true
+  systemctl --user enable podman-compose@dsmrreader || true
+  systemctl --user start podman-compose@dsmrreader || true
+else
+  echo "podman-compose systemd registration failed; continuing without autostart."
+fi
 '
 "
 
